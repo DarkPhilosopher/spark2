@@ -40,6 +40,13 @@ going back to edit something you made earlier.
 `/` opens a real typed line -- plain text is added to the log and
 shown right away; `/quit` (or plain `q`, or Ctrl-D) leaves.
 
+`/page [n]` cuts the whole history into fixed 15-line pages (the latest
+page if `n` is left off) and "types" that page out a few characters at
+a time, overwriting the log area in place rather than dumping it all
+at once -- the exact same feature already built for `~/termux-chat`,
+ported over unchanged in shape (same `PAGE_SIZE`/`page_count`/
+`page_lines`/`reveal_step`).
+
 ## Layout
 
 ```

@@ -386,6 +386,60 @@ DEMO = {
 
 
 # ---------------------------------------------------------------------------
+# chat history -- /page cuts it into fixed-size pieces and "types" one out
+# a few characters at a time, overwriting the log area in place rather
+# than dumping it all at once. Requested directly: "make so the chat box
+# shows pages of its history one at a time with overwrite existing and
+# type writer effect" -- the exact same feature already built for
+# ~/termux-chat, ported over: same PAGE_SIZE/page_count/page_lines/
+# reveal_step shapes, same fixed-count-not-screen-sized pagination.
+# ---------------------------------------------------------------------------
+
+PAGE_SIZE = 15
+CHARS_PER_TICK = 3   # ~30 chars/second at the main loop's own 10-tick-a-second pace
+
+
+def page_count(history, page_size):
+    """How many pages `history` makes at `page_size` lines each. 0 for
+    an empty history (there is no page 1 of nothing)."""
+    if not history or page_size < 1:
+        return 0
+    return -(-len(history) // page_size)   # ceiling division
+
+
+def page_lines(history, page_size, n):
+    """Page `n` (1-indexed), or None if `n` is out of range."""
+    total = page_count(history, page_size)
+    if total == 0 or n < 1 or n > total:
+        return None
+    start = (n - 1) * page_size
+    return history[start:start + page_size]
+
+
+def reveal_step(lines, shown):
+    """`shown` is how many characters (counting every line's own text,
+    newlines free) have been revealed so far. Returns (visible_lines,
+    done) -- visible_lines is `lines` with everything past `shown`
+    blanked out; done is True once every character has been shown.
+    Overshooting `shown` past the real total is safe -- it just reads
+    as done, forever, until something resets it -- so a caller never
+    has to know when to stop incrementing."""
+    out = []
+    remaining = shown
+    for line in lines:
+        if remaining >= len(line):
+            out.append(line)
+            remaining -= len(line)
+        elif remaining > 0:
+            out.append(line[:remaining])
+            remaining = 0
+        else:
+            out.append("")
+    total_chars = sum(len(line) for line in lines)
+    return out, shown >= total_chars
+
+
+# ---------------------------------------------------------------------------
 # the terminal loop -- thin: reads keys, advances state, draws
 # ---------------------------------------------------------------------------
 
@@ -484,7 +538,7 @@ def _grid_side(reserved_rows):
     return max(5, min(cols, rows - reserved_rows))
 
 
-def draw(world, side, history, log_h, held_color):
+def draw(world, side, history, log_h, held_color, reveal):
     out = [CLEAR_HOME]
     grid = [[" "] * side for _ in range(side)]
     # Props first, the player last, so standing on a placed pixel still
@@ -498,7 +552,18 @@ def draw(world, side, history, log_h, held_color):
                 % (world.tick, len(world.pixels), _ansi(held_color, "█"),
                    world.message or ""))
     out.append("-" * min(60, max(20, side)))
-    shown = history[-log_h:]
+    # The page-status line sits right under the rule, above the log's own
+    # content, not after it -- same reasoning chatshell.py's own draw()
+    # gives: it's a header for the content below, not a footer to it.
+    if reveal is not None:
+        visible, _ = reveal_step(reveal["lines"], reveal["shown"])
+        status = "-- page %d of %d --" % (reveal["page"], reveal["total"])
+    else:
+        visible = history
+        status = "%d line%s logged -- /page to look back" % (
+            len(history), "" if len(history) == 1 else "s")
+    out.append(status)
+    shown = visible[-log_h:] if len(visible) > log_h else visible
     shown = shown + [""] * (log_h - len(shown))
     out.extend(shown)
     out.append("arrows/wasd move . space spawns . c cycles colour . e edits . / chat . q quits")
@@ -512,13 +577,17 @@ def parse_command(text):
         return ("empty", None)
     if not text.startswith("/"):
         return ("say", text)
-    word = text[1:].split(None, 1)[0].lower() if len(text) > 1 else ""
+    parts = text[1:].split(None, 1)
+    word = (parts[0] if parts else "").lower()
+    rest = parts[1] if len(parts) > 1 else ""
+    if word == "page":
+        return ("page", rest.strip())
     if word in ("quit", "q"):
         return ("quit", None)
     return ("unknown", word)
 
 
-def chat_break(keyboard, history):
+def chat_break(keyboard, history, reveal_box):
     """Pressed "/": a real cooked line (or several -- stays open until
     a blank one), the same shape as Spark's own chat_break, for the
     same reason -- w/a/s/d moving the player while someone's trying to
@@ -527,7 +596,14 @@ def chat_break(keyboard, history):
     has no concept of plain chat text at all, everything typed there
     is a command), spark2's is genuinely either, so parse_command's own
     "/" means command, anything else is said" rule needs an actual
-    typed "/" to go with it, the same as chatshell.py's own prompt."""
+    typed "/" to go with it, the same as chatshell.py's own prompt.
+
+    `reveal_box` is a one-item list ([None] or [{"lines","shown","page",
+    "total"}]) rather than a plain variable, so /page can actually hand
+    a new reveal back to run()'s own loop -- the typewriter itself plays
+    out there, tick by tick, not inside this blocking cooked-input
+    sub-loop, so the game (and its own animation) keeps going the whole
+    time you're reading an old page."""
     keyboard.pause()
     sys.stdout.write(SHOW)
     try:
@@ -543,6 +619,21 @@ def chat_break(keyboard, history):
                 return True
             if kind == "say":
                 history.append("you: " + arg)
+                reveal_box[0] = None   # a new message always snaps back to "now"
+            elif kind == "page":
+                total = page_count(history, PAGE_SIZE)
+                try:
+                    n = int(arg) if arg else total
+                except ValueError:
+                    print("page number needs to be a plain number")
+                    continue
+                lines = page_lines(history, PAGE_SIZE, n)
+                if lines is None:
+                    print("nothing logged yet" if total == 0 else
+                          "no page %d -- there are %d" % (n, total))
+                    continue
+                reveal_box[0] = {"lines": lines, "shown": 0, "page": n, "total": total}
+                break   # close chat -- go watch it type itself out in the live view
             else:
                 history.append("no such command: /" + arg)
     finally:
@@ -555,20 +646,22 @@ LOG_H = 6
 
 
 def run():
-    side = _grid_side(LOG_H + 3)   # the status line, the rule, the hint line
+    # +4 reserved: the status line, the rule, the page-status line, the hint line
+    side = _grid_side(LOG_H + 4)
     config = dict(DEMO, width=side, height=side)
     world = World(config)
     player = world.spawn("player", side // 2, side // 2)
     history = ["arrows/wasd move, space spawns a pixel right in front of you",
                "c cycles the colour you're holding, e edits one you're on/next to",
-               "type / any time to chat"]
+               "type / any time to chat, /page [n] to look back"]
+    reveal_box = [None]   # [None] or [{"lines","shown","page","total"}] -- see chat_break
     with Keyboard() as keyboard:
         sys.stdout.write(HIDE)
         try:
             while True:
                 held = player.held_color if player is not None else COLOR_CYCLE[0]
                 try:
-                    draw(world, side, history, LOG_H, held)
+                    draw(world, side, history, LOG_H, held, reveal_box[0])
                 except Exception:
                     print(CLEAR_HOME)
                     print(traceback.format_exc())
@@ -576,9 +669,11 @@ def run():
                 if "quit" in keys:
                     break
                 if "/" in keys:
-                    if chat_break(keyboard, history):
+                    if chat_break(keyboard, history, reveal_box):
                         break
                     continue
+                if reveal_box[0] is not None:
+                    reveal_box[0]["shown"] += CHARS_PER_TICK
                 world.keys = _translate(keys)
                 try:
                     world.step()
